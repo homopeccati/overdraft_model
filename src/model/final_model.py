@@ -66,8 +66,9 @@ def train_final_model(
     best_params: dict = None,
     model_name: str = "LightGBM",
     calibrate: bool = True,
-    calibration_method: str = "isotonic",
+    calibration_method: str = "sigmoid",
     calibration_cv: int = 5,
+    threshold_metric: str = "accuracy",
     save_model: bool = True,
     model_path: str = None,
     plot: bool = True,
@@ -91,9 +92,12 @@ def train_final_model(
     calibrate : bool
         If True, apply ``CalibratedClassifierCV`` (Platt / Isotonic).
     calibration_method : str
-        "sigmoid" (Platt) or "isotonic".
+        "sigmoid" (Platt, default) or "isotonic".
     calibration_cv : int
         Number of folds for calibration (``cv`` parameter).
+    threshold_metric : str or float
+        Metric to optimise threshold: "accuracy" (default), "f1",
+        or a fixed float (e.g. 0.5) to use directly.
     save_model : bool
         If True, save model to disk.
     model_path : str or None
@@ -224,16 +228,31 @@ def train_final_model(
         y_calibrated = y_proba
 
     # ── Metrics ─────────────────────────────────────────────────────
-    # Threshold by F1
-    thresholds = np.linspace(0.01, 0.99, 200)
-    best_f1, best_t = 0, 0.5
-    for t in thresholds:
-        f1 = f1_score(y, (y_calibrated >= t).astype(int), zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_t = f1, t
+    from sklearn.metrics import accuracy_score
+
+    # Find best threshold
+    if isinstance(threshold_metric, (int, float)):
+        best_t = float(threshold_metric)
+    elif threshold_metric == "accuracy":
+        thresholds = np.linspace(0.01, 0.99, 500)
+        best_score, best_t = 0, 0.5
+        for t in thresholds:
+            score = accuracy_score(y, (y_calibrated >= t).astype(int))
+            if score > best_score:
+                best_score, best_t = score, t
+    elif threshold_metric == "f1":
+        thresholds = np.linspace(0.01, 0.99, 500)
+        best_score, best_t = 0, 0.5
+        for t in thresholds:
+            score = f1_score(y, (y_calibrated >= t).astype(int), zero_division=0)
+            if score > best_score:
+                best_score, best_t = score, t
+    else:
+        raise ValueError(f"threshold_metric must be 'accuracy', 'f1', or a float, got '{threshold_metric}'")
 
     y_pred = (y_calibrated >= best_t).astype(int)
     roc_auc = roc_auc_score(y, y_calibrated)
+    acc = accuracy_score(y, y_pred)
     f1 = f1_score(y, y_pred, zero_division=0)
     prec = precision_score(y, y_pred, zero_division=0)
     rec = recall_score(y, y_pred, zero_division=0)
@@ -241,6 +260,7 @@ def train_final_model(
     metrics = {
         "roc_auc": roc_auc,
         "gini": 2 * roc_auc - 1,
+        "accuracy": acc,
         "f1": f1,
         "precision": prec,
         "recall": rec,
@@ -248,13 +268,15 @@ def train_final_model(
     }
 
     if verbose:
+        always_0_acc = 1 - y.mean()
         print(f"\n  ── Metrics (train) ──")
-        print(f"  ROC-AUC:   {roc_auc:.4f}")
-        print(f"  Gini:      {metrics['gini']:.4f}")
-        print(f"  F1:        {f1:.4f}")
-        print(f"  Precision: {prec:.4f}")
-        print(f"  Recall:    {rec:.4f}")
-        print(f"  Threshold: {best_t:.4f}")
+        print(f"  ROC-AUC:           {roc_auc:.4f}")
+        print(f"  Gini:              {metrics['gini']:.4f}")
+        print(f"  Accuracy:          {acc:.4f}  (always-0 baseline: {always_0_acc:.4f})")
+        print(f"  F1:                {f1:.4f}")
+        print(f"  Precision:         {prec:.4f}")
+        print(f"  Recall:            {rec:.4f}")
+        print(f"  Threshold:         {best_t:.4f}  (optimised for: {threshold_metric})")
 
     # ── SHAP ────────────────────────────────────────────────────────
     shap_result = None
@@ -309,6 +331,8 @@ def generate_predictions(
     front_ids: pd.Series = None,
     calibrator=None,
     threshold: float = 0.5,
+    submission_format: str = "probability",
+    submission_col: str = "target_value",
     save: bool = True,
     output_path: str = None,
     verbose: bool = True,
@@ -327,7 +351,14 @@ def generate_predictions(
     calibrator : ``CalibratedClassifierCV`` or None
         Optional fitted calibrator.
     threshold : float
-        Classification threshold for predicted labels.
+        Classification threshold for predicted labels (used only
+        when ``submission_format="label"``).
+    submission_format : str
+        ``"probability"`` (default) — save probabilities to CSV.
+        ``"label"`` — save thresholded 0/1 labels.
+    submission_col : str
+        Column name for predictions in the saved CSV.
+        Default ``"target_value"`` matches competition format.
     save : bool
         If True, save to ``outputs/predictions.csv``.
     output_path : str or None
@@ -337,7 +368,7 @@ def generate_predictions(
 
     Returns
     -------
-    pd.DataFrame with columns: front_id, predicted_proba, [predicted_label]
+    pd.DataFrame with columns: front_id, predicted_proba, predicted_label
     """
     X_num = X_test.select_dtypes(include=[np.number])
 
@@ -360,17 +391,32 @@ def generate_predictions(
     if verbose:
         n_accepted = y_pred.sum()
         print(f"\n  Predictions: {len(pred_df):,} samples")
+        print(f"  Format:      {submission_format}")
         print(f"  Accepted:    {n_accepted:,} ({100 * n_accepted / len(pred_df):.2f}%)")
         print(f"  Declined:    {len(pred_df) - n_accepted:,} ({100 * (len(pred_df) - n_accepted) / len(pred_df):.2f}%)")
         print(f"  Threshold:   {threshold:.4f}")
+        print(f"  Proba range: {y_proba.min():.4f} - {y_proba.max():.4f}")
 
     if save:
         if output_path is None:
             os.makedirs(OUTPUTS_DIR, exist_ok=True)
             output_path = os.path.join(OUTPUTS_DIR, "predictions.csv")
-        pred_df.to_csv(output_path, index=False)
+
+        # Build submission-format DataFrame
+        if submission_format == "probability":
+            sub_df = pd.DataFrame({
+                "front_id": front_ids,
+                submission_col: y_proba,
+            })
+        else:  # "label"
+            sub_df = pd.DataFrame({
+                "front_id": front_ids,
+                submission_col: y_pred,
+            })
+
+        sub_df.to_csv(output_path, index=False)
         if verbose:
-            print(f"  Predictions saved: {output_path}")
+            print(f"  Saved:       {output_path}  (columns: {list(sub_df.columns)})")
 
     return pred_df
 
@@ -491,13 +537,17 @@ if __name__ == "__main__":
 
     # Final model
     final = train_final_model(X_tr, y_tr, best_params=tune_result["params"],
-                               model_name="LightGBM", plot=False)
+                               model_name="LightGBM",
+                               calibration_method="sigmoid",
+                               threshold_metric="accuracy",
+                               plot=False)
 
     # Predictions
     preds = generate_predictions(
         final["model"], X_te,
         front_ids=test_df["front_id"],
         calibrator=final["calibrator"],
-        threshold=final["metrics"]["threshold"],
+        submission_format="probability",
+        submission_col="target_value",
     )
     print(f"\nDone. Predictions shape: {preds.shape}")
